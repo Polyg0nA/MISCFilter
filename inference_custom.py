@@ -44,8 +44,7 @@ class CustomDeblurDataset(Dataset):
         img = Image.open(img_path).convert('RGB')
         img_tensor = TF.to_tensor(img)
         
-        name_without_ext = os.path.splitext(filename)[0]
-        return img_tensor, name_without_ext
+        return img_tensor, filename
 
 def main():
     parser = argparse.ArgumentParser(description='Memory-Efficient MISCFilter Deblurring')
@@ -152,8 +151,10 @@ def main():
             restored_img_np = restored_img.permute(0, 2, 3, 1).squeeze(0).cpu().numpy()
             restored_img_ubyte = (restored_img_np * 255.0).round().astype(np.uint8)
             
-            # Save output image
-            out_path = os.path.join(args.output_dir, f"{filename}_deblurred.png")
+            # Save output image using the same file extension as the input to prevent size inflation
+            name_part, ext_part = os.path.splitext(filename)
+            out_filename = f"{name_part}_deblurred{ext_part}"
+            out_path = os.path.join(args.output_dir, out_filename)
             utils.save_img(out_path, restored_img_ubyte)
             
     total_time = time.time() - start_time

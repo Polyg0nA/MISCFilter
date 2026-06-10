@@ -8,6 +8,7 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 import numpy as np
+
 # We do not import img_as_ubyte from skimage to minimize external dependencies.
 # Instead, we perform the standard float to uint8 scaling manually.
 
@@ -15,6 +16,28 @@ import numpy as np
 import utils
 from models.MISCFilterNet import MISCKernelNet as myNet
 from models.layers import window_partitionx, window_reversex
+
+# Helper functions for Geometric Self-Ensemble (Test-Time Augmentation)
+def transform(x, i):
+    # x: shape (B, C, H, W)
+    if i == 0: return x
+    elif i == 1: return torch.flip(x, [3]) # Flip Horizontal
+    elif i == 2: return torch.flip(x, [2]) # Flip Vertical
+    elif i == 3: return torch.rot90(x, 1, [2, 3]) # Rotate 90
+    elif i == 4: return torch.rot90(torch.flip(x, [3]), 1, [2, 3]) # Flip H + Rotate 90
+    elif i == 5: return torch.rot90(x, 2, [2, 3]) # Rotate 180
+    elif i == 6: return torch.rot90(x, 3, [2, 3]) # Rotate 270
+    elif i == 7: return torch.rot90(torch.flip(x, [3]), 3, [2, 3]) # Flip H + Rotate 270
+
+def inv_transform(x, i):
+    if i == 0: return x
+    elif i == 1: return torch.flip(x, [3])
+    elif i == 2: return torch.flip(x, [2])
+    elif i == 3: return torch.rot90(x, -1, [2, 3]) # Rotate -90
+    elif i == 4: return torch.flip(torch.rot90(x, -1, [2, 3]), [3])
+    elif i == 5: return torch.rot90(x, -2, [2, 3])
+    elif i == 6: return torch.rot90(x, -3, [2, 3])
+    elif i == 7: return torch.flip(torch.rot90(x, -3, [2, 3]), [3])
 
 # Custom dataset that handles image format conversion and reads images robustly
 class CustomDeblurDataset(Dataset):
@@ -57,6 +80,12 @@ def main():
                         help='normal: standard model; eval: folded model (load_checkpoint_compress_doconv)')
     parser.add_argument('--limit', default=-1, type=int, 
                         help='Limit the number of images to process (default -1: process all)')
+    parser.add_argument('--indices', default='', type=str, 
+                        help='Comma-separated list of 0-based image indices to process (e.g., "0,2,4")')
+    parser.add_argument('--filenames', default='', type=str, 
+                        help='Comma-separated list of exact filenames to process (e.g., "img1.jpg,img2.png")')
+    parser.add_argument('--self_ensemble', action='store_true', 
+                        help='Use geometric self-ensemble (8 rotations/flips) to improve deblurring quality')
     
     args = parser.parse_args()
     
@@ -67,17 +96,19 @@ def main():
     device = torch.device('cuda')
     print(f"Using GPU device: {torch.cuda.get_device_name(0)}")
     
-    # Create directories
+    # Create directories (clear previous results to only keep current run outputs)
+    if os.path.exists(args.output_dir):
+        print(f"Cleaning previous results in output directory: {args.output_dir}...")
+        import shutil
+        shutil.rmtree(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
     
     # 2. Initialize and Load Model
     print(f"Loading model with weights: {args.weights} (mode: {args.inference_mode})...")
     if args.inference_mode == 'eval':
-        # Instantiates the model using eval layers (DOConv2d_eval)
         model = myNet(inference=True)
         utils.load_checkpoint_compress_doconv(model, args.weights)
     else:
-        # Instantiates the standard model (inference=False)
         model = myNet(inference=False)
         utils.load_checkpoint(model, args.weights)
         
@@ -90,7 +121,25 @@ def main():
         print(f"Error: No images found in {args.input_dir}. Please place images in the input directory.")
         return
         
-    if args.limit > 0:
+    # Filter by specific indices (0-based)
+    if args.indices:
+        try:
+            target_indices = [int(idx.strip()) for idx in args.indices.split(',')]
+            dataset.img_filenames = [dataset.img_filenames[i] for i in target_indices if 0 <= i < len(dataset.img_filenames)]
+            dataset.size = len(dataset.img_filenames)
+            print(f"Filtering dataset by specified indices: {target_indices}")
+        except Exception as e:
+            print(f"Error parsing --indices: {e}")
+            
+    # Filter by specific filenames
+    if args.filenames:
+        target_files = [f.strip() for f in args.filenames.split(',')]
+        dataset.img_filenames = [f for f in dataset.img_filenames if f in target_files]
+        dataset.size = len(dataset.img_filenames)
+        print(f"Filtering dataset by specified filenames: {target_files}")
+        
+    # Slices dataset if limit is set (only if indices/filenames are not set)
+    if args.limit > 0 and not args.indices and not args.filenames:
         print(f"Limiting processing to the first {args.limit} images.")
         dataset.img_filenames = dataset.img_filenames[:args.limit]
         dataset.size = len(dataset.img_filenames)
@@ -107,44 +156,51 @@ def main():
             
             # Transfer tensor to CUDA
             img_tensor = img_tensor.to(device)
-            _, _, Hx, Wx = img_tensor.shape
             
-            # Step 4.1: Partition the large image into win_size x win_size patches
-            # input_re shape: (num_patches, 3, win_size, win_size)
-            input_re, batch_list = window_partitionx(img_tensor, args.win_size)
-            num_patches = input_re.shape[0]
+            # Setup Self-Ensemble
+            restored_accum = torch.zeros_like(img_tensor)
+            num_transforms = 8 if args.self_ensemble else 1
             
-            # Step 4.2: Feed patches through the network in smaller chunks to avoid VRAM OOM
-            restored_chunks = []
-            for i in range(0, num_patches, args.chunk_size):
-                # Clean CUDA cache regularly
-                torch.cuda.ipc_collect()
-                torch.cuda.empty_cache()
+            for t_idx in range(num_transforms):
+                # Apply transformation
+                t_img = transform(img_tensor, t_idx)
+                _, _, Hx, Wx = t_img.shape
                 
-                chunk = input_re[i : min(i + args.chunk_size, num_patches)]
+                # Step 4.1: Partition the transformed image into win_size x win_size patches
+                input_re, batch_list = window_partitionx(t_img, args.win_size)
+                num_patches = input_re.shape[0]
                 
-                # Forward pass
-                outputs = model(chunk)
-                
-                # Handle output tuple/list for normal mode
-                if isinstance(outputs, (list, tuple)):
-                    # normal mode returns a tuple: (outputs[::-1], outputs_fil[::-1])
-                    # outputs[0] is outputs[::-1], which is a list of tensors [out, out2, out3]
-                    first_output = outputs[0]
-                    if isinstance(first_output, (list, tuple)):
-                        restored_chunk = first_output[0]  # scale 1 output (full resolution)
-                    else:
-                        restored_chunk = first_output
-                else:
-                    restored_chunk = outputs
+                # Step 4.2: Feed patches through the network in smaller chunks
+                restored_chunks = []
+                for i in range(0, num_patches, args.chunk_size):
+                    torch.cuda.ipc_collect()
+                    torch.cuda.empty_cache()
                     
-                restored_chunks.append(restored_chunk)
+                    chunk = input_re[i : min(i + args.chunk_size, num_patches)]
+                    
+                    outputs = model(chunk)
+                    
+                    # Handle outputs list-nesting
+                    if isinstance(outputs, (list, tuple)):
+                        first_output = outputs[0]
+                        if isinstance(first_output, (list, tuple)):
+                            restored_chunk = first_output[0]  # scale 1 output (full resolution)
+                        else:
+                            restored_chunk = first_output
+                    else:
+                        restored_chunk = outputs
+                        
+                    restored_chunks.append(restored_chunk)
+                    
+                # Concatenate patches and reverse partition
+                restored_patches = torch.cat(restored_chunks, dim=0)
+                t_restored = window_reversex(restored_patches, args.win_size, Hx, Wx, batch_list)
                 
-            # Concatenate all restored patches
-            restored_patches = torch.cat(restored_chunks, dim=0)
-            
-            # Step 4.3: Reverse partition back to full image shape
-            restored_img = window_reversex(restored_patches, args.win_size, Hx, Wx, batch_list)
+                # Inverse transform back to original orientation
+                restored_accum += inv_transform(t_restored, t_idx)
+                
+            # Average the ensemble results
+            restored_img = restored_accum / num_transforms
             restored_img = torch.clamp(restored_img, 0.0, 1.0)
             
             # Convert to numpy array and save

@@ -173,8 +173,16 @@ def main():
                 # Step 4.2: Feed patches through the network in smaller chunks
                 restored_chunks = []
                 for i in range(0, num_patches, args.chunk_size):
+<<<<<<< HEAD
                     chunk = input_re[i : min(i + args.chunk_size, num_patches)]
                     
+=======
+                    torch.cuda.ipc_collect()
+                    torch.cuda.empty_cache()
+                    
+                    chunk = input_re[i : min(i + args.chunk_size, num_patches)]
+                    
+>>>>>>> cc0396741d51f05ba23f0b094f45fca28355d014
                     outputs = model(chunk)
                     
                     # Handle outputs list-nesting

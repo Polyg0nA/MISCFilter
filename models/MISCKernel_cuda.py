@@ -562,7 +562,7 @@ class FunctionKernel(torch.autograd.Function):
             raise NotImplementedError()
 
         # end
-
+        torch.cuda.synchronize()
         return output
 
     # end

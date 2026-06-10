@@ -107,10 +107,16 @@ def main():
     print(f"Loading model with weights: {args.weights} (mode: {args.inference_mode})...")
     if args.inference_mode == 'eval':
         model = myNet(inference=True)
+        param_init = next(model.parameters()).clone()
         utils.load_checkpoint_compress_doconv(model, args.weights)
     else:
         model = myNet(inference=False)
+        param_init = next(model.parameters()).clone()
         utils.load_checkpoint(model, args.weights)
+        
+    param_loaded = next(model.parameters())
+    param_diff = torch.sum(torch.abs(param_init - param_loaded)).item()
+    print(f"Loaded checkpoint successfully. First layer parameter diff: {param_diff:.6f}")
         
     model.to(device)
     model.eval()
@@ -208,6 +214,10 @@ def main():
             out_filename = f"{name_part}_deblurred{ext_part}"
             out_path = os.path.join(args.output_dir, out_filename)
             utils.save_img(out_path, restored_img_ubyte)
+            
+            # Diagnostic check: compare input and output pixels
+            pixel_diff = torch.mean(torch.abs(img_tensor - restored_img)).item()
+            print(f"Image '{filename}': mean absolute pixel difference = {pixel_diff:.6f}")
             
             # Clean CUDA cache at the end of each image
             torch.cuda.synchronize()

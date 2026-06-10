@@ -129,7 +129,13 @@ def main():
                 
                 # Handle output tuple/list for normal mode
                 if isinstance(outputs, (list, tuple)):
-                    restored_chunk = outputs[0]  # outputs[::-1][0] is the final scale output
+                    # normal mode returns a tuple: (outputs[::-1], outputs_fil[::-1])
+                    # outputs[0] is outputs[::-1], which is a list of tensors [out, out2, out3]
+                    first_output = outputs[0]
+                    if isinstance(first_output, (list, tuple)):
+                        restored_chunk = first_output[0]  # scale 1 output (full resolution)
+                    else:
+                        restored_chunk = first_output
                 else:
                     restored_chunk = outputs
                     

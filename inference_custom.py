@@ -3,14 +3,12 @@ import time
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 import numpy as np
-
-# We do not import img_as_ubyte from skimage to minimize external dependencies.
-# Instead, we perform the standard float to uint8 scaling manually.
 
 # Import project utilities and model
 import utils
@@ -86,6 +84,10 @@ def main():
                         help='Comma-separated list of exact filenames to process (e.g., "img1.jpg,img2.png")')
     parser.add_argument('--self_ensemble', action='store_true', 
                         help='Use geometric self-ensemble (8 rotations/flips) to improve deblurring quality')
+    parser.add_argument('--downsample_scale', default=1.0, type=float,
+                        help='Scale factor to downsample images before deblurring (e.g. 0.25, 0.5) to handle huge blurs')
+    parser.add_argument('--inject_high_freq', action='store_true',
+                        help='Inject original high-frequency details back after upsampling downscaled outputs')
     
     args = parser.parse_args()
     
@@ -162,14 +164,27 @@ def main():
             
             # Transfer tensor to CUDA
             img_tensor = img_tensor.to(device)
+            original_h, original_w = img_tensor.shape[2], img_tensor.shape[3]
+            
+            # Step 4.0: Downsample image before deblurring if scale is specified
+            if args.downsample_scale > 0.0 and args.downsample_scale != 1.0:
+                down_h = int(original_h * args.downsample_scale)
+                down_w = int(original_w * args.downsample_scale)
+                # Ensure height and width are multiples of 16 for standard network operations
+                down_h = max(16, (down_h // 16) * 16)
+                down_w = max(16, (down_w // 16) * 16)
+                img_tensor_proc = F.interpolate(img_tensor, size=(down_h, down_w), mode='bilinear', align_corners=False)
+            else:
+                img_tensor_proc = img_tensor
+                down_h, down_w = original_h, original_w
             
             # Setup Self-Ensemble
-            restored_accum = torch.zeros_like(img_tensor)
+            restored_accum = torch.zeros_like(img_tensor_proc)
             num_transforms = 8 if args.self_ensemble else 1
             
             for t_idx in range(num_transforms):
                 # Apply transformation
-                t_img = transform(img_tensor, t_idx)
+                t_img = transform(img_tensor_proc, t_idx)
                 _, _, Hx, Wx = t_img.shape
                 
                 # Step 4.1: Partition the transformed image into win_size x win_size patches
@@ -180,6 +195,7 @@ def main():
                 restored_chunks = []
                 for i in range(0, num_patches, args.chunk_size):
                     chunk = input_re[i : min(i + args.chunk_size, num_patches)]
+                    
                     outputs = model(chunk)
                     
                     # Handle outputs list-nesting
@@ -202,7 +218,23 @@ def main():
                 restored_accum += inv_transform(t_restored, t_idx)
                 
             # Average the ensemble results
-            restored_img = restored_accum / num_transforms
+            restored_img_proc = restored_accum / num_transforms
+            
+            # Step 4.3: Upsample back to original resolution and inject high frequencies if scale was modified
+            if args.downsample_scale > 0.0 and args.downsample_scale != 1.0:
+                deblurred_up = F.interpolate(restored_img_proc, size=(original_h, original_w), mode='bilinear', align_corners=False)
+                
+                if args.inject_high_freq:
+                    # Get low-frequency blurred component and compute high-frequency residual details
+                    blur_down = F.interpolate(img_tensor, size=(down_h, down_w), mode='bilinear', align_corners=False)
+                    blur_up = F.interpolate(blur_down, size=(original_h, original_w), mode='bilinear', align_corners=False)
+                    high_freq = img_tensor - blur_up
+                    restored_img = deblurred_up + high_freq
+                else:
+                    restored_img = deblurred_up
+            else:
+                restored_img = restored_img_proc
+                
             restored_img = torch.clamp(restored_img, 0.0, 1.0)
             
             # Convert to numpy array and save
